@@ -1,0 +1,3 @@
+sp_novedades_exportar_7_tablas.sql
+sp_novedades_unload_una.sql
+fn_novedades_dominio_json.sql
