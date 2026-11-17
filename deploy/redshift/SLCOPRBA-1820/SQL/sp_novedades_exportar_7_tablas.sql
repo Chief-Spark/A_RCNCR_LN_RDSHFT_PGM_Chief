@@ -52,6 +52,35 @@
 --   in_solicitud (execution_id del Framework) se guarda como ejecucion_id
 --   para trazabilidad; NO forma parte del run_id.
 --
+-- EL DELTA EXPORTA SOLO LO NUEVO (2026-11-17). Hasta hoy v_modo no era un
+-- predicado en ningun sitio -- solo etiquetaba la carpeta y el CTL -- de modo
+-- que un DELTA bajaba las ~363.000 filas enteras igual que un FULL. El
+-- consumidor de DynamoDB hace UPSERT por pk/sk, asi que un delta real es lo
+-- correcto.
+--
+-- EL FILTRO ES fecha_actualizacion > frontera, Y FUNCIONA POR COMO CARGA
+-- NOVEDADES: el cargador no hace UPDATE en sitio, hace DELETE + INSERT y solo
+-- sobre las filas de la ventana (sp_novedades_cargar_mat_ubicacion_edf.sql:36-70,
+-- WHERE flag_op IN ('I','A'); flag_op se construye solo para la ventana en
+-- sp_novedades_ubicacion_edf.sql:76-85). La fecha se mueve en altas Y en
+-- cambios, y NO se mueve en lo que no se toco.
+--   > ESTRICTO y no >=: en Unificacion el >= inclusivo hace que lo fechado en
+--     la frontera reentre en todos los DELTA para siempre. No se hereda.
+--
+-- DOS TABLAS SE TRATAN APARTE, Y NO ES CAPRICHO:
+--   mat_info_movilidad  es de EVENTOS y su SP la trunca en cada corrida
+--     (sp_novedades_movilidad_edf.sql): su contenido YA es el delta. Sin filtro.
+--   contactabilidad y punto_interes se arman por JOIN contra mat_info_ubicacion:
+--     el filtro va sobre la tabla HIJA (c./p.), nunca sobre la madre, o una
+--     ubicacion vieja con contacto nuevo se perderia.
+--
+-- LO QUE ESTE CAMBIO NO RESUELVE, Y ES PREGUNTA ABIERTA PARA EL CONSUMIDOR:
+--   con delta + UPSERT, un BORRADO es invisible. Si una fila desaparece de una
+--   mat_*, el delta no la menciona y Dynamo la conserva. Hoy no muerde porque
+--   flag_op = 'E' es codigo muerto en el legado y filas_bajas da 0, pero la
+--   salida -- un FULL periodico que reconcilie, o un tombstone en el CTL -- es
+--   decision del equipo que consume el bucket.
+--
 -- pk = tipo_identificacion || '#' || numero_identificacion  (nunca vacio).
 -- sk = segun tabla (GUIA seccion 3). Filas sin tipo/numero se EXCLUYEN.
 -- ============================================================
@@ -78,7 +107,11 @@ DECLARE
   v_region        VARCHAR(60);
 
   -- Contrato de corrida
-  v_modo          VARCHAR(64);
+  v_modo          VARCHAR(64);    -- modo PEDIDO (del mnemotecnico)
+  v_modo_efectivo VARCHAR(10);    -- modo APLICADO (FULL si no hay frontera)
+  v_bootstrap     BOOLEAN := FALSE;
+  v_wm_anterior   TIMESTAMP;      -- frontera: MAX(watermark_nuevo) completado
+  v_wm_nuevo      TIMESTAMP;      -- MAX(fecha_actualizacion) del dato de hoy
   v_ts_utc        VARCHAR(32);
   v_run_id        VARCHAR(200);
 
@@ -166,11 +199,50 @@ BEGIN
   END IF;
 
   -- ----------------------------------------------------------
+  -- 1b) FRONTERA DEL EXPORT Y DECISION DE BOOTSTRAP.
+  --   La frontera es SUYA, no la de nov_control: son procesos distintos y el
+  --   export puede correr mas veces que la carga. Acotada por ambiente.
+  --   Si no hay frontera previa se fuerza FULL aunque se pida DELTA, igual
+  --   que 16_sp_unificacion_ciclo.sql:180-185. Sin esto, el primer DELTA tras
+  --   un despliegue limpio exportaria CERO filas y el CTL diria que todo esta
+  --   al dia.
+  -- ----------------------------------------------------------
+  SELECT MAX(watermark_nuevo)
+    INTO v_wm_anterior
+    FROM bdm_datos.nov_export_control
+   WHERE estado = 'completado'
+     AND ambiente = v_ambiente;
+
+  IF v_wm_anterior IS NULL THEN
+    v_modo_efectivo := 'FULL';
+    v_bootstrap     := (v_modo = 'DELTA');
+  ELSE
+    v_modo_efectivo := v_modo;
+  END IF;
+
+  -- Frontera nueva: MAX(fecha_actualizacion) del DATO, nunca del reloj. Es la
+  -- leccion que ya costo un defecto en sp_novedades_ciclo_edf (watermark que
+  -- salia de CURRENT_DATE y dejaba el DELTA ciego).
+  SELECT MAX(f) INTO v_wm_nuevo FROM (
+    SELECT MAX(fecha_actualizacion) AS f FROM bdm_datos.mat_info_basica
+    UNION ALL SELECT MAX(fecha_actualizacion) FROM bdm_datos.mat_info_ubicacion
+    UNION ALL SELECT MAX(fecha_actualizacion) FROM bdm_datos.mat_info_actividad_economica
+    UNION ALL SELECT MAX(fecha_actualizacion) FROM bdm_datos.mat_ubicacion_agregada
+    UNION ALL SELECT MAX(fecha_actualizacion) FROM bdm_datos.mat_info_contactabilidad
+    UNION ALL SELECT MAX(fecha_actualizacion) FROM bdm_datos.mat_info_punto_interes
+    UNION ALL SELECT MAX(fecha_actualizacion) FROM bdm_datos.mat_info_movilidad
+  ) x;
+  -- Nunca retroceder: si hoy no hay dato, la frontera se queda donde estaba.
+  IF v_wm_nuevo IS NULL OR (v_wm_anterior IS NOT NULL AND v_wm_nuevo < v_wm_anterior) THEN
+    v_wm_nuevo := v_wm_anterior;
+  END IF;
+
+  -- ----------------------------------------------------------
   -- 2) Firma de los datos y control de re-exportacion (nov_export_control).
   --    Si los datos no cambiaron desde la ultima corrida 'completado' del
   --    ambiente, no se exporta de nuevo (no se crea carpeta en S3).
   -- ----------------------------------------------------------
-  v_firma := v_modo;
+  v_firma := v_modo_efectivo;
 
   SELECT 'basica:' || COUNT(*)::VARCHAR || ':' || COALESCE(MAX(lote), 0)::VARCHAR || ':'
          || COALESCE(TO_CHAR(MAX(fecha_actualizacion), 'YYYYMMDDHH24MISS'), '-')
@@ -226,18 +298,18 @@ BEGIN
   -- 3) run_id UNICO (UTC), prefijos y registro 'en_proceso'.
   -- ----------------------------------------------------------
   v_ts_utc     := TO_CHAR(SYSDATE AT TIME ZONE 'UTC', 'YYYYMMDD"T"HH24MISS"Z"');
-  v_run_id     := v_ts_utc || '_' || v_modo;
+  v_run_id     := v_ts_utc || '_' || v_modo_efectivo;
   v_run_prefix := v_base_prefix || '/' || v_run_id;
   v_data_prefix:= v_run_prefix || '/data';
   v_dominios   := '';
 
   INSERT INTO bdm_datos.nov_export_control (
     run_id, ejecucion_id, ambiente, modo, estado, firma_datos, s3_prefix,
-    fecha_inicio, usuario_bd)
+    bootstrap, watermark_anterior, fecha_inicio, usuario_bd)
   VALUES (
-    v_run_id, NULLIF(LEFT(TRIM(COALESCE(in_solicitud, '')), 256), ''), v_ambiente, v_modo,
+    v_run_id, NULLIF(LEFT(TRIM(COALESCE(in_solicitud, '')), 256), ''), v_ambiente, v_modo_efectivo,
     'en_proceso', v_firma, 's3://' || v_bucket || '/' || v_run_prefix || '/',
-    GETDATE(), CURRENT_USER);
+    v_bootstrap, v_wm_anterior, GETDATE(), CURRENT_USER);
   v_registrado := TRUE;
 
   -- ==========================================================
@@ -257,7 +329,8 @@ BEGIN
          'INFO_BASICA'::VARCHAR AS sk,
          b.*
   FROM bdm_datos.mat_info_basica b
-  WHERE b.tipo_identificacion IS NOT NULL AND b.numero_identificacion IS NOT NULL;
+  WHERE b.tipo_identificacion IS NOT NULL AND b.numero_identificacion IS NOT NULL
+    AND (v_modo_efectivo = 'FULL' OR b.fecha_actualizacion > v_wm_anterior);
   SELECT COUNT(*) INTO v_conteo FROM bdm_tempo.stg_nov_export_mat_info_basica;
   v_total := v_total + v_conteo;
   CALL bdm_datos.sp_novedades_unload_una(
@@ -275,7 +348,8 @@ BEGIN
          'UBICACION#' || u.id::VARCHAR AS sk,
          u.*
   FROM bdm_datos.mat_info_ubicacion u
-  WHERE u.tipo_identificacion IS NOT NULL AND u.numero_identificacion IS NOT NULL;
+  WHERE u.tipo_identificacion IS NOT NULL AND u.numero_identificacion IS NOT NULL
+    AND (v_modo_efectivo = 'FULL' OR u.fecha_actualizacion > v_wm_anterior);
   SELECT COUNT(*) INTO v_conteo FROM bdm_tempo.stg_nov_export_mat_info_ubicacion;
   v_total := v_total + v_conteo;
   CALL bdm_datos.sp_novedades_unload_una(
@@ -293,7 +367,8 @@ BEGIN
          'ACTIVIDAD#' || COALESCE(a.ciiu::VARCHAR, '') AS sk,
          a.*
   FROM bdm_datos.mat_info_actividad_economica a
-  WHERE a.tipo_identificacion IS NOT NULL AND a.numero_identificacion IS NOT NULL;
+  WHERE a.tipo_identificacion IS NOT NULL AND a.numero_identificacion IS NOT NULL
+    AND (v_modo_efectivo = 'FULL' OR a.fecha_actualizacion > v_wm_anterior);
   SELECT COUNT(*) INTO v_conteo FROM bdm_tempo.stg_nov_export_mat_info_acteco;
   v_total := v_total + v_conteo;
   CALL bdm_datos.sp_novedades_unload_una(
@@ -317,7 +392,8 @@ BEGIN
            || COALESCE(ag.ubicacion_dato, '') AS sk,
          ag.*
   FROM bdm_datos.mat_ubicacion_agregada ag
-  WHERE ag.tipo_identificacion IS NOT NULL AND ag.numero_identificacion IS NOT NULL;
+  WHERE ag.tipo_identificacion IS NOT NULL AND ag.numero_identificacion IS NOT NULL
+    AND (v_modo_efectivo = 'FULL' OR ag.fecha_actualizacion > v_wm_anterior);
   SELECT COUNT(*) INTO v_conteo FROM bdm_tempo.stg_nov_export_mat_ubi_agregada;
   v_total := v_total + v_conteo;
   CALL bdm_datos.sp_novedades_unload_una(
@@ -340,7 +416,8 @@ BEGIN
          c.*
   FROM bdm_datos.mat_info_contactabilidad c
   JOIN bdm_datos.mat_info_ubicacion u ON u.id = c.ubicacion_id
-  WHERE u.tipo_identificacion IS NOT NULL AND u.numero_identificacion IS NOT NULL;
+  WHERE u.tipo_identificacion IS NOT NULL AND u.numero_identificacion IS NOT NULL
+    AND (v_modo_efectivo = 'FULL' OR c.fecha_actualizacion > v_wm_anterior);
   SELECT COUNT(*) INTO v_conteo FROM bdm_tempo.stg_nov_export_mat_info_contact;
   v_total := v_total + v_conteo;
   CALL bdm_datos.sp_novedades_unload_una(
@@ -364,7 +441,8 @@ BEGIN
          p.*
   FROM bdm_datos.mat_info_punto_interes p
   JOIN bdm_datos.mat_info_ubicacion u ON u.cod_dw_ubic = p.ubicacion_id
-  WHERE u.tipo_identificacion IS NOT NULL AND u.numero_identificacion IS NOT NULL;
+  WHERE u.tipo_identificacion IS NOT NULL AND u.numero_identificacion IS NOT NULL
+    AND (v_modo_efectivo = 'FULL' OR p.fecha_actualizacion > v_wm_anterior);
   SELECT COUNT(*) INTO v_conteo FROM bdm_tempo.stg_nov_export_mat_info_pi;
   v_total := v_total + v_conteo;
   CALL bdm_datos.sp_novedades_unload_una(
@@ -403,7 +481,7 @@ BEGIN
   v_json :=
        '{'
     || '"run_id":"'     || v_run_id     || '",'
-    || '"tipo_carga":"' || v_modo       || '",'
+    || '"tipo_carga":"' || v_modo_efectivo || '",'
     || '"fecha_fin":"'  || v_ts_iso     || '",'
     || '"dominios":['   || v_dominios   || ']'
     || '}';
@@ -426,6 +504,7 @@ BEGIN
   UPDATE bdm_datos.nov_export_control
   SET estado          = 'completado',
       registros_total = v_total,
+      watermark_nuevo = v_wm_nuevo,
       fecha_fin       = GETDATE()
   WHERE run_id = v_run_id;
 
